@@ -78,6 +78,18 @@ In all options above except if merely re-exposing public APIs without alteration
 
 {% include requirement/MUST id="rust-client-convenience-telemetry-telemeter" %} telemeter the convenience client methods just like any service client methods.
 
+### Dependencies
+
+{% include important.html content="The following guidance applies to crates published after `azure_core` is made Generally Available. Until then, always only use workspace dependencies unless you are instructed otherwise e.g., those crates building on `azure_core_amqp`." %}
+
+{% include requirement/MUST id="rust-client-dependencies-general" %} follow [general guidelines on dependencies][rust-lang-dependencies].
+
+{% include requirement/MAY id="rust-client-dependencies-core-changes" %} use a `path` + `version` dependency on crates like `azure_core` within the workspace when new features are required. The version of the dependency should represent the next semver-compliant version and match the version specified in the `Cargo.toml` of the crate your `path` is referencing.
+
+This allows crates to work with changes in dependencies like `azure_core` while all the other crates continue to be built on the released version.
+
+{% include requirement/MUST id="rust-client-dependencies-core-release" %} switch back to using only a workspace dependency after the crate requiring feature updates has been released. `path` + `version` dependencies are only allowed while those features are in development.
+
 ### Tests {#rust-client-tests}
 
 We will implement tests [idiomatically with cargo][rust-lang-tests].
@@ -128,6 +140,271 @@ mod tests {
 #### Examples {#rust-client-tests-examples}
 
 {% include requirement/SHOULD id="rust-client-tests-examples-location" %} include examples under the `examples/` subdirectory for primary use cases. These are written as standalone executables but may include shared code modules.
+
+#### Documentation examples {#rust-client-tests-doc-examples}
+
+[Documentation tests][rust-lang-doc-tests] are powerful. Not only are they compiled (unless `ignore`), but can be executed (unless `no_run`) with `cargo test --doc` (run by default with `cargo test`). They also allow you to hide setup code e.g., if you want to call an async function:
+
+```rust
+/// ```no_run
+/// # #[tokio::main] fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let credential: DeveloperToolsCredential = unimplemented!();
+/// let client = SecretClient::new("https://my-vault.vault.azure.net", credential.clone(), None)?;
+/// let secret = client.get_secret("my-secret", None).await?.into_model()?;
+/// println!("{secret:#?}");
+/// # Ok(()) }
+```
+
+In Rust documentation comments, on <https://docs.rs>, etc., you'll only see:
+
+```rust
+let client = SecretClient::new("https://my-vault.vault.azure.net", credential.clone(), None)?;
+let secret = client.get_secret("my-secret", None).await?.into_model()?;
+println!("{secret:#?}");
+```
+
+But all those lines will render in plain markdown like in `README.md` on <https://github.com> and elsewhere.
+Instead, there's [`include-file`](https://crates.io/crates/include-file) that lets you achieve the same result in `README.md` while compiling or even executing those snippets as tests.
+
+{% include requirement/MAY id="rust-client-tests-doc-examples-include" %} use the [`include_file::include_markdown!()`][include-file] macro to render Rust code snippets while compiling or even executing those snippets as tests.
+
+In your `README.md`, you'll include only the code you want to show in a `rust ignore` code fence (it has to be ignored because it won't compile without a lot of setup code) along with a unique name within that file that identifies your example, like `get-secret`:
+
+````markdown
+```rust ignore get-secret
+let secret = client.get_secret("my-secret", None).await?.into_model()?;
+println!("{secret:#?}");
+```
+````
+
+Add a `tests/readme.rs` file that includes your setup code similar to what we would've hidden in Rust documentation comments and reference section in the `README.md` (relative to the crate root):
+
+```rust
+use azure_identity::DeveloperToolsCredential;
+use azure_security_keyvault_secrets::SecretClient;
+use include_file::include_markdown;
+
+#[ignore = "requires provisioned resources"]
+#[tokio::test]
+async fn readme() -> Result<(), Box<dyn std::error::Error>> {
+    let credential = DeveloperToolsCredential::new(None)?;
+    let client = SecretClient::new("https://my-vault.vault.azure.net", credential, None)?;
+
+    include_markdown("README.md", "get-secret");
+
+    Ok(())
+}
+```
+
+The test has `#[ignore]` because we can't actually execute it without provisioning resources, but we can compile it; however, you can use recorded tests.
+
+{% include requirement/MAY id="rust-client-tests-doc-examples-recorded" %} use recorded tests to actually execute documentation examples.
+
+The markdown is the same, but we change the signature of the test like so:
+
+```rust
+use azure_core::Result;
+use azure_core_test::{recorded, TestContext};
+use azure_security_keyvault_secrets::{SecretClient, SecretClientOptions};
+use include_file::include_markdown;
+
+#[recorded::test]
+async fn readme(ctx: TestContext) -> Result<()> {
+    let recording = ctx.recording();
+
+    let mut options = SecretClientOptions::default();
+    recording.instrument(&mut options.client_options);
+
+    let client = SecretClient::new(
+        "https://my-vault.vault.azure.net",
+        recording.credential(),
+        Some(options),
+    )?;
+
+    include_markdown("README.md", "get-secret");
+
+    Ok(())
+}
+```
+
+Now you can record and later play back your tests. See our [contribution guide for integration tests](https://github.com/Azure/azure-sdk-for-rust/blob/main/CONTRIBUTING.md#integration-tests) for details.
+
+For a complete example, see pull request [Azure/azure-sdk-for-rust#3337](https://github.com/Azure/azure-sdk-for-rust/pull/3337/files).
+
+## Errors {#rust-errors}
+
+All client methods return an `azure_core::Result<T>` by default, which is defined as:
+
+```rust
+pub type Result<T> = std::result::Result<T, azure_core::Error>;
+```
+
+`azure_core::Error` provides consistent error handling for all clients built upon `azure_core`. You can get detailed HTTP information including the service response like so:
+
+```rust
+use azure_core::error::{ErrorKind, ErrorResponse};
+
+let result = client.get_model("example", None).await;
+let model = match result {
+    Ok(response) => response.into_model()?,
+    Err(err) => match err.kind() {
+        ErrorKind::HttpResponse { raw_response: Some(raw_response), .. } => {
+            let error: ErrorResponse = raw_response.body().json()?;
+            eprintln!("Error: {:?}", &error.error);
+            return Err(err);
+        },
+        _ => return Err(err),
+    },
+};
+```
+
+### Custom error models {#rust-errors-models}
+
+If you want to make service-specific error information more accessible, you can expose error models that can deserialize the body and/or read headers from the raw response.
+
+{% include requirement/MAY id="rust-errors-models-custom" %} define service-specific error models which customers may deserialize e.g.,
+
+```rust
+use serde::Deserialize;
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceErrorResponse {
+    pub error: Option<ServiceError>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceError {
+    pub code: Option<u32>,
+    pub message: Option<String>,
+    #[serde(default)]
+    pub inner_errors: Vec<ServiceError>,
+}
+```
+
+{% include requirement/SHOULD id="rust-errors-models-custom-example" %} include an example under your crate's `examples/` folder of how customers can deserialize your custom error e.g.,
+
+```rust
+use azure_core::{
+    error::ErrorKind,
+    http::{RawResponse, StatusCode, headers::Headers},
+};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Simulate an error response
+    let response = br#"{
+        "error": {
+            "code": 43004,
+            "message": "failed to make fetch happen",
+            "innerErrors": [
+                {
+                    "message": "no response"
+                }
+            ]
+        }
+    }"#;
+    let raw_response = RawResponse::from_bytes(
+        StatusCode::InternalServerError,
+        Headers::new(),
+        response.as_ref(),
+    );
+    let result: Result<(), azure_core::Error> = Err(ErrorKind::HttpResponse {
+        status: raw_response.status(),
+        error_code: Some("Internal service error".into()),
+        raw_response: Some(Box::new(raw_response)),
+    }
+    .into());
+
+    // Handle the error case
+    if let Err(err) = result {
+        match err.kind() {
+            ErrorKind::HttpResponse {
+                raw_response: Some(raw_response),
+                ..
+            } => {
+                let error = raw_response
+                    .body()
+                    .json::<ServiceErrorResponse>()?
+                    .error
+                    .ok_or("failed to deserialize service error")?;
+                eprintln!(
+                    "Service returned error {}: {}",
+                    error.code.unwrap_or_default(),
+                    error.message.unwrap_or_else(|| "unknown".into())
+                );
+                return Err(Box::new(err));
+            }
+            _ => return Err(Box::new(err)),
+        }
+    };
+
+    Ok(())
+}
+```
+
+{% include requirement/MAY id="rust-errors-models-try-from" %} implement `TryFrom<azure_core::Error>` for your error model(s).
+
+If you do implement `TryFrom<azure_core::Error>` for your error model(s):
+
+{% include requirement/MUST id="rust-errors-models-fallback" %} return the original `azure_core::Error` if the `ErrorKind` is not `ErrorKind::HttpResponse` or the response does not indicate a service-specific error.
+
+```rust
+// src/error.rs
+use azure_core::{error::ErrorKind, http::StatusCode};
+use serde::Deserialize;
+use std::fmt;
+
+pub type Result<T> = std::result::Result<T, StorageError>;
+
+#[derive(Debug, Clone)]
+pub struct StorageError {
+    pub status_code: StatusCode,
+    pub message: Option<String>,
+    pub reason: Option<String>,
+    // ...
+}
+
+impl fmt::Display for StorageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        todo!()
+    }
+}
+
+impl std::error::Error for StorageError {}
+
+impl TryFrom<azure_core::Error> for StorageError {
+    type Error = azure_core::Error;
+
+    fn try_from(err: azure_core::Error) -> azure_core::Result<Self> {
+        match err.kind() {
+            ErrorKind::HttpResponse {
+                status,
+                raw_response: Some(raw_response),
+                ..
+            } => {
+                #[derive(Deserialize)]
+                struct StorageErrorXml {
+                    message: Option<String>,
+                    reason: Option<String>,
+                }
+
+                let error: StorageErrorXml = raw_response.body().xml()?;
+                let error = StorageError {
+                    status_code: *status,
+                    message: error.message,
+                    reason: error.reason,
+                };
+                Ok(error)
+            }
+            _ => Err(azure_core::Error::new(
+                ErrorKind::DataConversion,
+                "not a service error",
+            )),
+        }
+    }
+}
+```
 
 ## Traits {#rust-traits}
 

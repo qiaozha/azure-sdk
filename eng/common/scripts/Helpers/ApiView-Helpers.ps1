@@ -124,7 +124,7 @@ function Set-ApiViewCommentForRelatedIssues {
   param (
     [Parameter(Mandatory = $true)]
     [string]$HeadCommitish,
-    [string]$APIViewHost = "https://apiview.dev",
+    [string]$APIViewHost = "https://apiview.org",
     [ValidateNotNullOrEmpty()]
     [Parameter(Mandatory = $true)]
     $AuthToken
@@ -132,7 +132,7 @@ function Set-ApiViewCommentForRelatedIssues {
   . ${PSScriptRoot}\..\common.ps1
   $issuesForCommit = $null
   try {
-    $issuesForCommit = Search-GitHubIssues -CommitHash $HeadCommitish
+    $issuesForCommit = Search-GitHubIssues -CommitHash $HeadCommitish -AuthToken $AuthToken
     if ($issuesForCommit.items.Count -eq 0) {
       LogInfo "No issues found for commit: $HeadCommitish"
       Write-Host "##vso[task.complete result=SucceededWithIssues;]DONE"
@@ -215,7 +215,7 @@ function Set-ApiViewCommentForPR {
   try {
     $existingComment = Get-GitHubIssueComments -RepoOwner $RepoOwner -RepoName $RepoName -IssueNumber $PrNumber -AuthToken $AuthToken
     $existingAPIViewComment = $existingComment | Where-Object {
-      $_.body.StartsWith("**API Change Check**", [StringComparison]::OrdinalIgnoreCase) -or $_.body.StartsWith("## API Change Check", [StringComparison]::OrdinalIgnoreCase) }
+      $_.body.StartsWith("**API Change Check**", [StringComparison]::OrdinalIgnoreCase) -or $_.body.StartsWith("## API Change Check", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -Last 1
   } catch {
     LogWarning "Failed to get comments from Pull Request: $PrNumber in repo: $repoFullName"
   }
@@ -241,7 +241,7 @@ function Set-ApiViewCommentForPR {
 # Helper function used to create API review requests for Spec generation SDKs pipelines
 function Create-API-Review {
   param (
-    [string]$apiviewEndpoint = "https://apiview.dev/api/PullRequests/CreateAPIRevisionIfAPIHasChanges",
+    [string]$apiviewEndpoint = "https://apiview.org/api/PullRequests/CreateAPIRevisionIfAPIHasChanges",
     [string]$specGenSDKArtifactPath,
     [string]$apiviewArtifactName,
     [string]$buildId,

@@ -12,20 +12,23 @@ Set-StrictMode -Version 3
 
 function Get-android-Packages
 {
-  # Rest API docs https://search.maven.org/classic/#api
-  $baseMavenQueryUrl = "https://search.maven.org/solrsearch/select?q=g:com.azure.android&rows=100&wt=json"
-  $mavenQuery = Invoke-RestMethod "https://search.maven.org/solrsearch/select?q=g:com.azure.android&rows=2000&wt=json" -MaximumRetryCount 3
-
+  $userAgent = "azure-sdk-indexing"
+  $headers = @{ "Content-Signal" = "search=yes,ai-train=no" }
+  $baseMavenQueryUrl = "https://central.sonatype.com/solrsearch/select?q=g:com.azure.android&rows=100&wt=json"
+  Write-Host "Calling $baseMavenQueryUrl"
+  $mavenQuery = Invoke-RestMethod $baseMavenQueryUrl -MaximumRetryCount 3 -UserAgent $userAgent -Headers $headers
+  
   Write-Host "Found $($mavenQuery.response.numFound) android packages on maven packages"
 
   $packages = @()
-  $count = 0
-  while ($count -lt $mavenQuery.response.numFound)
+  $start = 0
+  while ($mavenQuery.response.docs.count -ne 0)
   {
     $packages += $mavenQuery.response.docs | Foreach-Object { CreatePackage $_.a $_.latestVersion $_.g }
-    $count += $mavenQuery.response.docs.count
-
-    $mavenQuery = Invoke-RestMethod ($baseMavenQueryUrl + "&start=$count") -MaximumRetryCount 3
+    $start += 1
+    
+    Write-Host "Calling ${baseMavenQueryUrl}&start=$start"
+    $mavenQuery = Invoke-RestMethod "${baseMavenQueryUrl}&start=$start" -MaximumRetryCount 3 -UserAgent $userAgent -Headers $headers
   }
 
   return $packages
@@ -33,23 +36,51 @@ function Get-android-Packages
 
 function Get-java-Packages
 {
-  # Rest API docs https://search.maven.org/classic/#api
-  $baseMavenQueryUrl = "https://search.maven.org/solrsearch/select?q=g:com.microsoft.azure*%20OR%20g:com.azure*&rows=100&wt=json"
-  $mavenQuery = Invoke-RestMethod $baseMavenQueryUrl -MaximumRetryCount 3
+  $userAgent = "azure-sdk-indexing"
+  $headers = @{ "Content-Signal" = "search=yes,ai-train=no" }
+  $groupIds = @(
+    "com.azure",
+    "com.azure.cosmos.kafka",
+    "com.azure.cosmos.spark",
+    "com.azure.resourcemanager",
+    "com.azure.spring",
+    "com.azure.tools",
+    "com.azure.v2",
+    "com.microsoft.azure",
+    "io.clientcore"
+  )
+  $groupIds = $groupIds | % { "g:" + $_ }
+  $groupIdQuery = $groupIds -join "+OR+"
+  $baseMavenQueryUrl = "https://central.sonatype.com/solrsearch/select?q=${groupIdQuery}&rows=100&wt=json"
+  Write-Host "Calling $baseMavenQueryUrl"
+  $mavenQuery = Invoke-RestMethod $baseMavenQueryUrl -MaximumRetryCount 3 -UserAgent $userAgent -Headers $headers
 
   Write-Host "Found $($mavenQuery.response.numFound) java packages on maven packages"
 
   $packages = @()
-  $count = 0
-  while ($count -lt $mavenQuery.response.numFound)
+  $start = 0
+  while ($mavenQuery.response.docs.count -ne 0)
   {
-    $packages += $mavenQuery.response.docs | Foreach-Object { if ($_.g -ne "com.azure.android") { CreatePackage $_.a $_.latestVersion $_.g } }
-    $count += $mavenQuery.response.docs.count
+    $packages += $mavenQuery.response.docs | Foreach-Object { CreatePackage $_.a $_.latestVersion $_.g }
+    $start += 1
 
-    $mavenQuery = Invoke-RestMethod ($baseMavenQueryUrl + "&start=$count") -MaximumRetryCount 3
+    Write-Host "Calling ${baseMavenQueryUrl}&start=$start"
+    $mavenQuery = Invoke-RestMethod "${baseMavenQueryUrl}&start=$start" -MaximumRetryCount 3 -UserAgent $userAgent -Headers $headers
   }
 
   $repoTags = GetPackageVersions "java"
+  
+  foreach ($tag in $repoTags.Keys)
+  {
+    $artifactId = $tag
+    if ($tag.Contains("+")) {
+      $_, $artifactId = $tag.Split("+")
+    }
+
+    if ($packages.Package -notcontains $artifactId) {
+      Write-Host "${tag} - Didn't find this package using the maven search $baseMavenQueryUrl."
+    }
+  }
 
   foreach ($package in $packages)
   {
@@ -57,7 +88,7 @@ function Get-java-Packages
     # then treat it as a new mgmt library
     if ($package.GroupId -eq "com.azure.resourcemanager" `
         -and $package.Package -match "^azure-resourcemanager-(?<serviceName>.*?)$" `
-        -and $repoTags.ContainsKey($package.Package))
+        -and ($repoTags.ContainsKey($package.Package) -or $repoTags.ContainsKey("$($package.GroupId)+$($package.Package)")))
     {
       $serviceName = (Get-Culture).TextInfo.ToTitleCase($matches["serviceName"])
       $package.Type = "mgmt"
@@ -77,10 +108,20 @@ function Get-dotnet-Packages
   # Rest API docs
   # https://docs.microsoft.com/nuget/api/search-query-service-resource
   # https://docs.microsoft.com/nuget/consume-packages/finding-and-choosing-packages#search-syntax
-  $nugetQuery = Invoke-RestMethod "https://azuresearch-usnc.nuget.org/query?q=owner:azure-sdk&prerelease=true&semVerLevel=2.0.0&take=1000" -MaximumRetryCount 3
+  $nugetSkip = 0
+  $nugetTake = 1000
+  $nugetPackages = @()
 
-  Write-Host "Found $($nugetQuery.totalHits) nuget packages"
-  $packages = $nugetQuery.data | Foreach-Object { CreatePackage $_.id $_.version }
+  do {
+    $nugetUrl = "https://azuresearch-usnc.nuget.org/query?q=owner:azure-sdk&prerelease=true&semVerLevel=2.0.0&take=$nugetTake&skip=$nugetSkip"
+    Write-Host "Calling $nugetUrl"
+    $nugetQuery = Invoke-RestMethod $nugetUrl -MaximumRetryCount 3
+    $nugetPackages += $nugetQuery.data
+    $nugetSkip += $nugetQuery.data.Count
+  } while ($nugetQuery.data.Count -gt 0 -and $nugetSkip -lt $nugetQuery.totalHits)
+
+  Write-Host "Found $($nugetPackages.Count) nuget packages"
+  $packages = $nugetPackages | Foreach-Object { CreatePackage $_.id $_.version }
 
   $repoTags = GetPackageVersions "dotnet"
 
@@ -141,7 +182,17 @@ function Get-js-Packages
   }
 
   Write-Host "Found $($publishedPackages.Count) npm packages"
-  $packages = $publishedPackages | Foreach-Object { CreatePackage $_.name $_.version }
+  $packages = $publishedPackages | Foreach-Object {
+    $version = $_.version
+    if ($_.version -match "-alpha") {
+      $pkgInfo = Invoke-RestMethod "https://registry.npmjs.com/$($_.name)"
+      if ($pkgInfo."dist-tags".PSObject.Properties.Name -contains "beta") {
+        # Replace version with latest beta if the latest tag is an alpha version
+        $version = $pkgInfo."dist-tags"."beta"
+      }
+    }
+    CreatePackage $_.name $version
+  }
 
   $repoTags = GetPackageVersions "js"
 

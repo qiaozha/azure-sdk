@@ -11,9 +11,6 @@
   .PARAMETER ignoreLinksFile
   Specifies the file that contains a set of links to ignore when verifying.
 
-  .PARAMETER devOpsLogging
-  Switch that will enable devops specific logging for warnings.
-
   .PARAMETER recursive
   Check the links recurisvely. Applies to links starting with 'baseUrl' parameter. Defaults to true.
 
@@ -70,7 +67,6 @@
 param (
   [string[]] $urls,
   [string] $ignoreLinksFile = "$PSScriptRoot/ignore-links.txt",
-  [switch] $devOpsLogging = $false,
   [switch] $recursive = $true,
   [string] $baseUrl = "",
   [string] $rootUrl = "",
@@ -88,6 +84,8 @@ param (
 )
 
 Set-StrictMode -Version 3.0
+
+. "$PSScriptRoot/logging.ps1"
 
 $ProgressPreference = "SilentlyContinue"; # Disable invoke-webrequest progress dialog
 
@@ -121,6 +119,9 @@ function ProcessLink([System.Uri]$linkUri) {
   elseif ($linkUri -match '^https?://crates\.io(/(?<path>(crates|users|teams)/.+))?') {
     # See comment in function below for details.
     return ProcessCratesIoLink $linkUri $matches['path']
+  }
+  elseif ($linkUri -match '^https?://(www\.)?npmjs\.com/package/.+') {
+    return ProcessNpmLink $linkUri
   }
   else {
     return ProcessStandardLink $linkUri
@@ -157,6 +158,31 @@ function ProcessCratesIoLink([System.Uri]$linkUri, $path) {
   Invoke-WebRequest -Uri $apiUri -Method GET -UserAgent $userAgent -TimeoutSec $requestTimeoutSec | Out-Null
   
   return $true
+}
+
+function ProcessNpmLink([System.Uri]$linkUri) {
+  # npmjs.com started using Cloudflare which returns 403 and we need to instead check the registry api for existence checks
+  # https://github.com/orgs/community/discussions/174098#discussioncomment-14461226
+  
+  # Handle versioned URLs: https://www.npmjs.com/package/@azure/ai-agents/v/1.1.0 -> https://registry.npmjs.org/@azure/ai-agents/1.1.0
+  # Handle non-versioned URLs: https://www.npmjs.com/package/@azure/ai-agents -> https://registry.npmjs.org/@azure/ai-agents
+  # The regex captures the package name (which may contain a slash for scoped packages) and optionally the version.
+  # Query parameters and URL fragments are excluded from the transformation.
+  $urlString = $linkUri.ToString()
+  if ($urlString -match '^https?://(?:www\.)?npmjs\.com/package/([^?#]+)/v/([^?#]+)') {
+    # Versioned URL: remove the /v/ segment but keep the version
+    $apiUrl = "https://registry.npmjs.org/$($matches[1])/$($matches[2])"
+  }
+  elseif ($urlString -match '^https?://(?:www\.)?npmjs\.com/package/([^?#]+)') {
+    # Non-versioned URL: just replace the domain
+    $apiUrl = "https://registry.npmjs.org/$($matches[1])"
+  }
+  else {
+    # Fallback: use the original URL if it doesn't match expected patterns
+    $apiUrl = $urlString
+  }
+
+  return ProcessStandardLink ([System.Uri]$apiUrl)
 }
 
 function ProcessStandardLink([System.Uri]$linkUri) {
@@ -209,30 +235,6 @@ function NormalizeUrl([string]$url) {
     }
   }
   return $uri
-}
-
-function LogWarning
-{
-  if ($devOpsLogging)
-  {
-    Write-Host "##vso[task.LogIssue type=warning;]$args"
-  }
-  else
-  {
-    Write-Warning "$args"
-  }
-}
-
-function LogError
-{
-  if ($devOpsLogging)
-  {
-    Write-Host "##vso[task.logissue type=error]$args"
-  }
-  else
-  {
-    Write-Error "$args"
-  }
 }
 
 function ResolveUri ([System.Uri]$referralUri, [string]$link)
@@ -554,9 +556,10 @@ foreach ($url in $urls) {
   $pageUrisToCheck.Enqueue($uri);
 }
 
-if ($devOpsLogging) {
-  Write-Host "##[group]Link checking details"
-}
+LogGroupStart "Link checking details"
+
+$originalcheckLinkGuidance = $checkLinkGuidance
+
 while ($pageUrisToCheck.Count -ne 0)
 {
   $pageUri = $pageUrisToCheck.Dequeue();
@@ -564,6 +567,11 @@ while ($pageUrisToCheck.Count -ne 0)
   try {
     if ($checkedPages.ContainsKey($pageUri)) { continue }
     $checkedPages[$pageUri] = $true;
+
+    # copilot instructions require the use of relative links which is against our general guidance
+    # but we mainly care about those guidelines for docs publishing and not copilot instructions
+    # so we can disable the guidelines while validating copilot instruction files.
+    if ($pageUri -match "instructions.md$") { $checkLinkGuidance = $false }
 
     [string[]] $linkUris = GetLinks $pageUri
     Write-Host "Checking $($linkUris.Count) links found on page $pageUri";
@@ -588,13 +596,13 @@ while ($pageUrisToCheck.Count -ne 0)
   } catch {
     Write-Host "Exception encountered while processing pageUri $pageUri : $($_.Exception)"
     throw
+  } finally {
+    $checkLinkGuidance = $originalcheckLinkGuidance
   }
 }
 
 try {
-  if ($devOpsLogging) {
-    Write-Host "##[endgroup]"
-  }
+  LogGroupEnd
 
   if ($badLinks.Count -gt 0) {
     Write-Host "Summary of broken links:"
